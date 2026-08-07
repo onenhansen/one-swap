@@ -16,6 +16,18 @@
 #:esxi_user: 'root'                       # ESXi username. Also used by delta prepare/commit when passwordless SSH is not available.
 #:esxi_pass: 'changeme123'                # ESXi password. Also used by delta prepare/commit when passwordless SSH is not available.
 
+# NetApp Shift Options
+# Note: like every key here, an uncommented value overrides the command line;
+# an uncommented :shift: forces Shift mode for every convert run.
+#:shift: 'https://172.20.0.124'           # Shift Toolkit appliance URL (scheme and host, no port)
+#:shift_user: 'admin'                     # Shift username
+#:shift_pass: 'changeme123'               # Shift password
+#:shift_mount: '/mnt/shift'               # Local mount of the source NFS datastore holding the converted qcow2 disks
+#:shift_blueprint: 'bp-name'              # Pre-created blueprint (DR plan) to execute; one run converts every VM in it
+#:shift_skip_conversion: false            # Skip compliance/trigger/wait and import qcow2 disks already on the mount
+#:shift_wait_timeout: 0                   # Max seconds to wait for the blueprint execution (0 waits until Ctrl+C)
+#:shift_script_dir:                       # Override the shift-api-automation/Python scripts directory
+
 # Transfer Options
 #:custom_convert:                         # Uses OpenNebula's custom conversion process, useful for distributions which are not supported or fail to convert
 #:fallback:                               # Fallback to OpenNebula's custom conversion process

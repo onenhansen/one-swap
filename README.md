@@ -145,6 +145,57 @@ indefinitely. Either finish with `--delta --delta-commit` or run
 For detailed behavior, metric selection, confidence levels, and examples, see
 the official OpenNebula documentation.
 
+## NetApp Shift Conversion
+
+With `--shift`, the VMDK-to-qcow2 disk conversion is delegated to a
+[NetApp Shift Toolkit](https://docs.netapp.com/us-en/netapp-solutions/shift-toolkit/shift-overview.html)
+appliance instead of virt-v2v. Shift converts on the ONTAP storage side
+(FlexClone based), so the disks never travel through the OneSwap worker.
+OneSwap still gathers VM properties from vCenter, runs the guest
+customization (context, VirtIO, QEMU Guest Agent) and creates the OpenNebula
+images and template.
+
+Prerequisites, all created in the Shift UI beforehand:
+
+- A source site (vCenter + ONTAP) and a destination site.
+- One or more resource groups containing the VMs to convert.
+- A blueprint (DR plan) referencing those resource groups.
+- The source NFS datastore mounted locally on the OneSwap host
+  (`--shift-mount`); Shift writes `<vm-name>.qcow2` (plus
+  `<vm-name>_1.qcow2`, ... for additional disks) next to each VM folder.
+- `virt-v2v-in-place` installed, and the Python dependencies of the vendored
+  shift-api-automation scripts (`pip install requests envyaml pymongo`).
+- Source VMs powered off.
+
+```
+SOPTS='--shift https://<shift-ip> --shift-user admin --shift-pass ...'
+SOPTS="$SOPTS --shift-blueprint bp1 --shift-mount /mnt/shift"
+
+# Convert and import every VM in the blueprint
+oneswap convert $VOPTS $SOPTS
+
+# Convert the blueprint once, but only import selected VMs (in this order)
+oneswap convert $VOPTS $SOPTS --vms vm-web-01,vm-db-01
+
+# Import a single VM whose disks were already converted (re-runs, recovery)
+oneswap convert vm-web-01 $VOPTS $SOPTS --shift-skip-conversion
+```
+
+Notes:
+
+- A blueprint execution converts **every** VM in its resource group(s), in
+  parallel, regardless of which VMs are then imported. Keep blueprints
+  aligned with what you intend to import.
+- The OS morph (`virt-v2v-in-place`) and context injection modify the qcow2
+  files on the datastore in place -- there is no local copy, so terabyte
+  disks work on workers with small local storage. To regenerate a disk,
+  re-run the blueprint in the Shift UI; re-importing an already imported VM
+  without regenerating it is unsupported (the guest would be morphed twice).
+- The wait for the blueprint execution runs until it finishes; interrupt
+  with Ctrl+C or bound it with `:shift_wait_timeout:` in `oneswap.yaml`.
+- `--shift` cannot be combined with `--delta`, `--hybrid`, `--custom`,
+  `--fallback`, `--vddk`, `--esxi`, `--clone` or `--dry-run`.
+
 ## vCenter Permissions Requirements
 
 OneSwap requires specific vCenter permissions depending on the conversion mode used. Below are the required privileges for vCenter 8.

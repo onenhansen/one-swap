@@ -18,6 +18,7 @@ require 'one_helper'
 require 'opennebula'
 require 'logger'
 require 'fileutils'
+require 'rexml/document'
 require 'shellwords'
 require 'socket'
 require 'tempfile'
@@ -30,6 +31,7 @@ require_relative 'vsphere_client'
 require_relative 'esxi_vm'
 require_relative 'windows_tuner'
 require_relative 'oneswap_logger'
+require_relative 'netapp_shift_helper'
 
 class String
 
@@ -1913,6 +1915,70 @@ _EOF_"
         disks_on_file = Dir.children(conversion_dir).map {|disk| File.join(conversion_dir, disk) }
 
         create_one_images(disks_on_file)
+    end
+
+    # NetApp Shift conversion. The blueprint execution (triggered once per
+    # invocation, before the per-VM loop) already wrote the converted qcow2
+    # disks to the source NFS datastore, so this only morphs and imports.
+    #
+    # The morph runs virt-v2v-in-place directly against the files on the
+    # mount -- no local copy, since guest disks can exceed the worker's local
+    # storage. That mutates Shift's output: regenerating a disk means
+    # re-running the blueprint.
+    def run_shift_conversion
+        local_path_image_allocation_preflight!
+
+        disk_count = vc_virtual_disks.length
+        raise "vCenter reports no virtual disks for #{@options[:name]}" if disk_count.zero?
+
+        shift = new_netapp_shift(@options)
+        disks = shift.converted_disks(@options[:name], @options[:shift_mount], disk_count)
+
+        env = v2v_env
+        warn_unreadable_kernel_for_libguestfs(env)
+        env_prefix = env.map {|k, v| "#{k}=#{Shellwords.escape(v)} " }.join
+
+        # -i disk only accepts a single disk; multi-disk guests go through a
+        # minimal libvirt domain XML so inspection sees the whole guest.
+        input = if disks.length == 1
+                    "-i disk #{Shellwords.escape(disks.first)}"
+                else
+                    "-i libvirtxml #{Shellwords.escape(write_shift_domain_xml(disks))}"
+                end
+
+        _stdout, status = run_cmd_report(
+            "#{env_prefix}virt-v2v-in-place #{input} -v --machine-readable", true
+        )
+        raise "virt-v2v-in-place failed for #{@options[:name]}" unless status.success?
+
+        create_one_images(disks)
+    end
+
+    # Minimal libvirt domain definition referencing the converted disks in
+    # order, written into work_dir for virt-v2v-in-place -i libvirtxml.
+    def write_shift_domain_xml(disks)
+        doc = REXML::Document.new
+        doc << REXML::XMLDecl.new
+
+        domain = doc.add_element('domain', 'type' => 'kvm')
+        domain.add_element('name').text = @options[:name]
+        memory_mb = @props.dig('config', :hardware, :memoryMB) || 1024
+        domain.add_element('memory', 'unit' => 'MiB').text = memory_mb.to_s
+        domain.add_element('vcpu').text = '1'
+        domain.add_element('os').add_element('type').text = 'hvm'
+
+        devices = domain.add_element('devices')
+        disks.each_with_index do |path, i|
+            disk = devices.add_element('disk', 'type' => 'file', 'device' => 'disk')
+            disk.add_element('driver', 'name' => 'qemu', 'type' => 'qcow2')
+            disk.add_element('source', 'file' => path)
+            disk.add_element('target', 'dev' => "sd#{('a'.ord + i).chr}", 'bus' => 'scsi')
+        end
+
+        xml_path = File.join(@options[:work_dir], "#{@options[:name]}-shift-domain.xml")
+        File.open(xml_path, 'w') {|f| doc.write(f, 2) }
+
+        xml_path
     end
 
     def local_path_image_allocation_preflight!
@@ -3811,6 +3877,62 @@ GUESTFISH
         end
     end
 
+    # VM names a Shift blueprint would convert, straight from the appliance.
+    # Used to default the batch to "everything in the blueprint" and to
+    # validate requested names before triggering a long conversion.
+    #
+    # @param options [Hash] CLI options (shift server/credentials/blueprint)
+    # @return [Array<String>]
+    def shift_blueprint_vm_names(options)
+        apply_verbosity(options)
+
+        new_netapp_shift(options).blueprint_vm_names(options[:shift_blueprint])
+    rescue NetAppShift::Error => e
+        raise e.message
+    end
+
+    # Trigger the Shift blueprint execution and block until it completes.
+    # Called once per invocation, before the per-VM import loop: one
+    # execution converts every VM in the blueprint's resource group(s).
+    #
+    # @param options [Hash] CLI options (shift server/credentials/blueprint)
+    def shift_execute_blueprint(options)
+        apply_verbosity(options)
+        @options = options
+        check_one_connectivity
+        # Fail before hours of conversion if the frontend could not import
+        # the disks afterwards.
+        local_path_image_allocation_preflight!
+
+        shift = new_netapp_shift(options)
+        bp    = options[:shift_blueprint]
+
+        puts "Running Shift compliance check for blueprint '#{bp}'..."
+        shift.check!(shift.run_compliance_check(bp))
+
+        puts "Triggering Shift blueprint execution (#{NetAppShift::Helper::CONVERSION})..."
+        trigger = shift.check!(shift.trigger_migration(bp))
+        exec_id = trigger[:execution_id]
+        raise 'Shift accepted the blueprint execution but reported no execution id' if exec_id.nil?
+
+        puts "Waiting for Shift execution #{exec_id} to complete (Ctrl+C to abort)..."
+        status = shift.wait_for_completion(bp, exec_id, :timeout => options[:shift_wait_timeout])
+        puts "Shift blueprint '#{bp}' finished: #{status[:status]}".green
+    rescue NetAppShift::Error => e
+        raise e.message
+    end
+
+    # Shared NetAppShift::Helper constructor for the shift_* entry points.
+    def new_netapp_shift(options)
+        NetAppShift::Helper.new(
+            :server     => options[:shift],
+            :username   => options[:shift_user],
+            :password   => options[:shift_pass],
+            :script_dir => options[:shift_script_dir],
+            :logger     => @logger
+        )
+    end
+
     # Read and parse a VM list file for batch conversion.
     # Empty lines and lines starting with # are ignored.
     #
@@ -4220,6 +4342,8 @@ GUESTFISH
                       run_custom_conversion
                   elsif @options[:delta]
                       run_delta_conversion
+                  elsif @options[:shift]
+                      run_shift_conversion
                   else
                       run_v2v_conversion
                   end
