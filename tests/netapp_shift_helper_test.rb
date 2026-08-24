@@ -71,6 +71,34 @@ class ParserTest < Minitest::Test
 
         assert data[:ok]
         assert_equal 'exec-77', data[:execution_id]
+        refute data[:already_executed]
+    end
+
+    # Shift refuses a second execution of an already-converted blueprint.
+    # Verbatim body from a real appliance (note their "succesful" typo -- do
+    # not match on it).
+    ERSCSTEX009 = log_line(
+        'Failed to execute blueprint 588314a3-1a5c-4b26-9cbd-cc8c7b394e36 with mode ' \
+        'clone_based_conversion, Response code is 500, response message is ' \
+        '{"level":"error","message":"ERSCSTEX009: The -convert execution is succesful ' \
+        'for Blueprint - 588314a3-1a5c-4b26-9cbd-cc8c7b394e36. No further execution ' \
+        'is allowed.","errors":[]}', 'ERROR'
+    ).freeze
+
+    def test_trigger_migration_detects_already_executed
+        data = parse(:trigger_migration, ERSCSTEX009)
+
+        assert data[:already_executed]
+        refute data[:ok]
+        assert_nil data[:execution_id]
+    end
+
+    def test_other_trigger_failures_are_not_already_executed
+        data = parse(:trigger_migration,
+                     log_line('Failed to execute blueprint bp-1, Response code is 401', 'ERROR'))
+
+        refute data[:already_executed]
+        refute data[:ok]
     end
 
     def test_migration_status_complete
@@ -119,6 +147,58 @@ class ParserTest < Minitest::Test
         errors = bare_helper.send(:error_lines, out)
 
         assert_equal ['Failed to create blueprint, Response code is 500'], errors
+    end
+
+end
+
+class CheckBangErrorSelectionTest < Minitest::Test
+
+    # A real trigger_migration failure: blueprint.py logs the HTTP status and
+    # body first, trigger_migration.py appends two generic trailers.
+    TRIGGER_FAILURE = [
+        log_line('Failed to execute blueprint bp-1 with mode clone_based_conversion, ' \
+                 'Response code is 400, response message is {"error":"already executed"}',
+                 'ERROR'),
+        log_line('Triggering Migration operation for blueprint multidisk was not ' \
+                 'successful using POST run compliance API', 'ERROR'),
+        log_line('Migration trigger failed for migration index 1', 'ERROR')
+    ].join("\n").freeze
+
+    def failing_result(output)
+        NetAppShift::Result.new(:trigger_migration,
+                                :output   => output,
+                                :errors   => bare_helper.send(:error_lines, output),
+                                :data     => { :ok => false },
+                                :duration => 1.0)
+    end
+
+    def test_prefers_the_line_with_the_http_status
+        err = assert_raises(NetAppShift::OperationError) do
+            bare_helper.check!(failing_result(TRIGGER_FAILURE))
+        end
+
+        assert_includes err.message, 'Response code is 400'
+        assert_includes err.message, 'already executed'
+        refute_includes err.message, 'migration index 1'
+    end
+
+    def test_falls_back_to_first_error_without_a_status_line
+        output = [log_line('Something broke', 'ERROR'),
+                  log_line('Migration trigger failed for migration index 1', 'ERROR')].join("\n")
+
+        err = assert_raises(NetAppShift::OperationError) do
+            bare_helper.check!(failing_result(output))
+        end
+
+        assert_includes err.message, 'Something broke'
+    end
+
+    def test_falls_back_to_generic_message_without_errors
+        err = assert_raises(NetAppShift::OperationError) do
+            bare_helper.check!(failing_result(log_line('nothing useful')))
+        end
+
+        assert_includes err.message, 'no success message'
     end
 
 end
@@ -380,6 +460,104 @@ class BlueprintVmNamesTest < Minitest::Test
         calls.clear
         assert_raises(NetAppShift::OperationError) { helper.blueprint_vm_names('nope') }
         assert_includes calls, '/api/tenant/session/end'
+    end
+
+end
+
+class BlueprintExecutionStateTest < Minitest::Test
+
+    BLUEPRINTS = {
+        'list' => [{ '_id' => 'bp-1', 'name' => 'multidisk', 'protectionGroups' => [] }]
+    }.freeze
+
+    # Helper whose api_request replays a canned /api/recovery/drplan/status
+    def state_helper(status_body)
+        helper = quiet_helper
+        ports  = []
+        helper.define_singleton_method(:api_request) do |_method, port, path, **_kw|
+            ports << [port, path]
+            case path
+            when '/api/tenant/session'          then { 'session' => { '_id' => 'sid-1' } }
+            when '/api/tenant/session/end'      then {}
+            when '/api/setup/drplan'            then BLUEPRINTS
+            when '/api/recovery/drplan/status'  then status_body
+            else raise "unexpected path #{path}"
+            end
+        end
+        [helper, ports]
+    end
+
+    def entry(recovery_status, exec_id = 'ex-1', bp_id = 'bp-1')
+        { 'drPlan'        => { '_id' => bp_id, 'recoveryStatus' => recovery_status },
+          'lastExecution' => { '_id' => exec_id, 'status' => 4 } }
+    end
+
+    def test_completed_conversion
+        helper, ports = state_helper([entry('convert_complete')])
+
+        state = helper.blueprint_execution_state('multidisk')
+
+        assert state[:complete]
+        refute state[:running]
+        refute state[:failed]
+        assert_equal 'convert_complete', state[:status]
+        assert_equal 'ex-1', state[:execution_id]
+
+        # must query the recovery service, not the setup service
+        assert_includes ports, [NetAppShift::Helper::RECOVERY_PORT,
+                                '/api/recovery/drplan/status']
+    end
+
+    def test_running_execution
+        helper, = state_helper([entry('convert_inprogress')])
+
+        state = helper.blueprint_execution_state('multidisk')
+
+        assert state[:running]
+        refute state[:complete]
+        assert_equal 'ex-1', state[:execution_id]
+    end
+
+    def test_failed_execution
+        helper, = state_helper([entry('convert_error')])
+
+        state = helper.blueprint_execution_state('multidisk')
+
+        assert state[:failed]
+        refute state[:complete]
+        refute state[:running]
+    end
+
+    def test_never_run_returns_nil
+        # blueprint absent from the status list entirely
+        helper, = state_helper([entry('convert_complete', 'ex-9', 'bp-other')])
+
+        assert_nil helper.blueprint_execution_state('multidisk')
+    end
+
+    def test_empty_status_returns_nil
+        helper, = state_helper([entry('')])
+
+        assert_nil helper.blueprint_execution_state('multidisk')
+    end
+
+    def test_empty_status_list_returns_nil
+        helper, = state_helper([])
+
+        assert_nil helper.blueprint_execution_state('multidisk')
+    end
+
+    # Some appliances may wrap the collection the way the setup service does
+    def test_tolerates_list_envelope
+        helper, = state_helper('list' => [entry('convert_complete')])
+
+        assert helper.blueprint_execution_state('multidisk')[:complete]
+    end
+
+    def test_tolerates_junk_entries
+        helper, = state_helper(['nonsense', nil, entry('convert_complete')])
+
+        assert helper.blueprint_execution_state('multidisk')[:complete]
     end
 
 end

@@ -733,7 +733,11 @@ CommandParser::CmdParser.new(ARGV) do
             end
 
             cfg_file = normalize_config.call(YAML.load_file(options[:config_file])) if File.exist?(options[:config_file])
-            options.merge!(cfg_file) if cfg_file
+            # Config file supplies defaults; anything given on the command
+            # line wins. `replace` keeps the same Hash object because later
+            # code mutates it in place (convert appends the VM name to
+            # :work_dir).
+            options.replace(cfg_file.merge(options)) if cfg_file
             options[:object] = args[0]
             helper.parse_opts(options)
             helper.list(options)
@@ -790,7 +794,11 @@ CommandParser::CmdParser.new(ARGV) do
             end
             options[:config_file] ||= '/etc/one/oneswap.yaml'
             cfg_file = normalize_config.call(YAML.load_file(options[:config_file])) if File.exist?(options[:config_file])
-            options.merge!(cfg_file) if cfg_file
+            # Config file supplies defaults; anything given on the command
+            # line wins. `replace` keeps the same Hash object because later
+            # code mutates it in place (convert appends the VM name to
+            # :work_dir).
+            options.replace(cfg_file.merge(options)) if cfg_file
 
             if (options[:download_stripes] || 1).to_i > 1 && !options[:hybrid]
                 raise '--download-stripes N > 1 requires --hybrid.'
@@ -1032,7 +1040,11 @@ CommandParser::CmdParser.new(ARGV) do
 
             options[:config_file] ||= '/etc/one/oneswap.yaml'
             cfg_file = normalize_config.call(YAML.load_file(options[:config_file])) if File.exist?(options[:config_file])
-            options.merge!(cfg_file) if cfg_file
+            # Config file supplies defaults; anything given on the command
+            # line wins. `replace` keeps the same Hash object because later
+            # code mutates it in place (convert appends the VM name to
+            # :work_dir).
+            options.replace(cfg_file.merge(options)) if cfg_file
 
             raise 'ESXi Transfer requires at least IP and Password' if options[:esxi_ip] && options[:esxi_pass].nil?
             raise 'ESXI and VDDK cannot be used at same time, recommend VDDK.' if options[:esxi_ip] && options[:vddk_path]

@@ -185,6 +185,11 @@ class FakeShift
         @calls     = []
     end
 
+    def blueprint_execution_state(bp)
+        @calls << [:state, bp]
+        @responses.fetch(:state, nil)
+    end
+
     def run_compliance_check(bp)
         @calls << [:compliance, bp]
         @responses.fetch(:compliance)
@@ -284,6 +289,96 @@ class ShiftExecuteBlueprintTest < Minitest::Test
         h = orchestration_helper(fake)
 
         assert_equal %w[web01 db01], h.shift_blueprint_vm_names(OPTIONS.dup)
+    end
+
+    # The reported bug: a blueprint that already converted must not be
+    # triggered again (Shift rejects it), it must fall through to import.
+    def test_already_converted_blueprint_skips_compliance_and_trigger
+        fake = FakeShift.new(:state => { :status => 'convert_complete', :complete => true,
+                                         :running => false, :failed => false,
+                                         :execution_id => 'ex-1' })
+        h = orchestration_helper(fake)
+
+        out, = capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+
+        assert_equal [[:state, 'bp1']], fake.calls
+        assert_includes out, 'already been converted'
+    end
+
+    def test_running_blueprint_attaches_to_existing_execution
+        fake = FakeShift.new(
+            :state => { :status => 'convert_inprogress', :complete => false,
+                        :running => true, :failed => false, :execution_id => 'ex-7' },
+            :wait  => result(:check_migration_status, :ok => true,
+                             :status => 'convert_complete')
+        )
+        h = orchestration_helper(fake)
+
+        capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+
+        assert_includes fake.calls, [:wait, 'bp1', 'ex-7', 3600]
+        refute_includes fake.calls.map(&:first), :trigger
+        refute_includes fake.calls.map(&:first), :compliance
+    end
+
+    def test_failed_blueprint_raises_without_triggering
+        fake = FakeShift.new(:state => { :status => 'convert_error', :complete => false,
+                                         :running => false, :failed => true,
+                                         :execution_id => 'ex-3' })
+        h = orchestration_helper(fake)
+
+        err = assert_raises(RuntimeError) do
+            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+        end
+
+        assert_includes err.message, 'last execution failed'
+        refute_includes fake.calls.map(&:first), :trigger
+    end
+
+    # Safety net for when the status pre-check does not see the blueprint:
+    # Shift's own ERSCSTEX009 rejection must be treated as "already done",
+    # not as a failure.
+    def test_erscstex009_on_trigger_is_not_an_error
+        fake = FakeShift.new(
+            :state      => nil,
+            :compliance => result(:run_compliance_check, :ok => true),
+            :trigger    => result(:trigger_migration, :ok => false, :already_executed => true)
+        )
+        h = orchestration_helper(fake)
+
+        out, = capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+
+        assert_includes out, 'already been converted'
+        refute_includes fake.calls.map(&:first), :wait
+    end
+
+    def test_other_trigger_failures_still_raise
+        fake = FakeShift.new(
+            :state      => nil,
+            :compliance => result(:run_compliance_check, :ok => true),
+            :trigger    => result(:trigger_migration, :ok => false, :already_executed => false)
+        )
+        h = orchestration_helper(fake)
+
+        assert_raises(RuntimeError) do
+            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+        end
+    end
+
+    def test_never_run_blueprint_still_triggers
+        fake = FakeShift.new(
+            :state      => nil,
+            :compliance => result(:run_compliance_check, :ok => true),
+            :trigger    => result(:trigger_migration, :ok => true, :execution_id => 'ex-9'),
+            :wait       => result(:check_migration_status, :ok => true,
+                                  :status => 'convert_complete')
+        )
+        h = orchestration_helper(fake)
+
+        capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+
+        assert_includes fake.calls, [:compliance, 'bp1']
+        assert_includes fake.calls, [:trigger, 'bp1']
     end
 
 end

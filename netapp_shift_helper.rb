@@ -154,9 +154,11 @@ module NetAppShift
         MIGRATION  = 'clone_based_migration'.freeze
 
         # Appliance service ports, matching the Python API modules: the tenant
-        # session service and the setup service (sites/resource groups/plans).
-        SESSION_PORT = 3698
-        SETUP_PORT   = 3700
+        # session service, the setup service (sites/resource groups/plans) and
+        # the recovery service (executions/job status).
+        SESSION_PORT  = 3698
+        SETUP_PORT    = 3700
+        RECOVERY_PORT = 3704
 
         # operation => basename shared by the script and its JSON payload.
         # The payload path is fixed by Config.yml, so it cannot be overridden
@@ -404,6 +406,60 @@ module NetAppShift
             end
         end
 
+        # Current execution state of a blueprint, or nil if it has never run.
+        #
+        # This is what makes repeat invocations work: a blueprint that has
+        # already executed cannot be executed again until its prior executions
+        # are deleted (NetApp ships PowerShell/removeBpJobs.ps1 for that), and
+        # one execution converts every VM in the resource group anyway. So the
+        # caller checks here first and imports the existing disks instead of
+        # triggering a second time.
+        #
+        # GET :3704/api/recovery/drplan/status returns a list of
+        #   { 'drPlan' => {'_id', 'recoveryStatus'}, 'lastExecution' => {'_id', 'status'} }
+        # recoveryStatus is the same string verify_blueprint_status keys off:
+        # it contains "complete" or "error" once terminal.
+        #
+        # Note this is only an optimisation: it saves a pointless compliance
+        # check and trigger. The authoritative signal that a blueprint cannot
+        # run again is the ERSCSTEX009 error the trigger itself returns, which
+        # #parse_trigger_migration reports as :already_executed.
+        #
+        # @return [Hash, nil] :status, :execution_id, :complete, :failed, :running
+        def blueprint_execution_state(blueprint_name)
+            api_session do |sid|
+                id       = api_find_blueprint(sid, blueprint_name)['_id']
+                response = api_get(sid, RECOVERY_PORT, '/api/recovery/drplan/status')
+
+                @logger.debug("NetApp Shift: drplan/status -> #{response.inspect}")
+
+                # Bare array in the appliances seen so far, but tolerate the
+                # setup service's {'list' => [...]} envelope too.
+                entries = response.is_a?(Hash) ? Array(response['list']) : Array(response)
+
+                entry = entries.find do |e|
+                    e.is_a?(Hash) && e.dig('drPlan', '_id') == id
+                end
+
+                if entry.nil?
+                    @logger.debug("NetApp Shift: blueprint #{id} not present in drplan/status")
+                    next nil
+                end
+
+                status = entry.dig('drPlan', 'recoveryStatus').to_s
+
+                next nil if status.empty?
+
+                {
+                    :status       => status,
+                    :execution_id => entry.dig('lastExecution', '_id'),
+                    :complete     => status.include?('complete'),
+                    :failed       => status.include?('error'),
+                    :running      => !status.match?(/complete|error/)
+                }
+            end
+        end
+
         # ------------------------------------------------------------------ #
         # Locating the converted disks                                        #
         # ------------------------------------------------------------------ #
@@ -499,10 +555,14 @@ module NetAppShift
         def check!(result)
             return result if result.ok?
 
+            # The scripts log root cause first and a generic trailer last
+            # ("Migration trigger failed for migration index 1"), so prefer
+            # the line carrying the HTTP status and response body.
             reason = if result.timed_out?
                          "timed out after #{result.duration}s"
                      elsif result.errors.any?
-                         result.errors.last
+                         result.errors.find {|e| e.include?('Response code') } ||
+                             result.errors.first
                      else
                          'the script logged no success message'
                      end
@@ -647,6 +707,13 @@ module NetAppShift
             response = api_request(Net::HTTP::Get, SETUP_PORT, path, :session => session_id)
 
             Array(response['list'])
+        end
+
+        # GET a path on any service port, returning the parsed body as-is.
+        # The recovery endpoints answer with a bare array rather than the
+        # setup service's {'list' => [...]} envelope.
+        def api_get(session_id, port, path)
+            api_request(Net::HTTP::Get, port, path, :session => session_id)
         end
 
         def api_find_blueprint(session_id, blueprint_name)
@@ -897,10 +964,20 @@ module NetAppShift
             }
         end
 
+        # Shift refuses to execute a blueprint that already converted
+        # successfully, with ERSCSTEX009 "No further execution is allowed".
+        # That is not a failure for OneSwap -- the disks it needs are already
+        # on the datastore -- so it is reported separately from :ok.
+        ALREADY_EXECUTED = /ERSCSTEX009|No further execution is allowed/i.freeze
+
         def parse_trigger_migration(output)
             id = output[/Migration triggered for blueprint .* with execution id:\s*(\S+)/, 1]
 
-            { :ok => !id.nil?, :execution_id => id }
+            {
+                :ok               => !id.nil?,
+                :execution_id     => id,
+                :already_executed => id.nil? && output.match?(ALREADY_EXECUTED)
+            }
         end
 
         def parse_migration_status(output)

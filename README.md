@@ -177,7 +177,10 @@ oneswap convert $VOPTS $SOPTS
 # Convert the blueprint once, but only import selected VMs (in this order)
 oneswap convert $VOPTS $SOPTS --vms vm-web-01,vm-db-01
 
-# Import a single VM whose disks were already converted (re-runs, recovery)
+# Import more VMs later; the blueprint is not executed again
+oneswap convert vm-app-01 $VOPTS $SOPTS
+
+# Import without contacting Shift at all (disks known to be on the mount)
 oneswap convert vm-web-01 $VOPTS $SOPTS --shift-skip-conversion
 ```
 
@@ -186,6 +189,14 @@ Notes:
 - A blueprint execution converts **every** VM in its resource group(s), in
   parallel, regardless of which VMs are then imported. Keep blueprints
   aligned with what you intend to import.
+- One execution serves every later `oneswap convert` against that blueprint.
+  OneSwap checks the blueprint state first and, if it has already converted,
+  reuses the disks on the mount instead of executing again -- Shift rejects a
+  second execution until the previous one is cleared. If an execution is
+  still running, OneSwap attaches to it and waits instead of starting another.
+  To genuinely convert again, clear the blueprint execution in the Shift UI
+  (or with the `removeBpJobs.ps1` script NetApp ships) and re-run.
+  `--shift-skip-conversion` is only needed to skip talking to Shift entirely.
 - The OS morph (`virt-v2v-in-place`) and context injection modify the qcow2
   files on the datastore in place -- there is no local copy, so terabyte
   disks work on workers with small local storage. To regenerate a disk,

@@ -1984,7 +1984,7 @@ _EOF_"
     def local_path_image_allocation_preflight!
         return if @options[:http_transfer]
 
-        puts 'Local PATH mode requires OneSwap to run on the OpenNebula frontend or work_dir to be shared at the same path.'
+        @logger.debug 'Local PATH mode requires OneSwap to run on the OpenNebula frontend or work_dir to be shared at the same path.'
 
         endpoint_host = opennebula_endpoint_host
         return if endpoint_host.nil? || local_opennebula_endpoint?(endpoint_host)
@@ -3907,11 +3907,42 @@ GUESTFISH
         shift = new_netapp_shift(options)
         bp    = options[:shift_blueprint]
 
+        # A blueprint that has already executed cannot be executed again until
+        # its prior executions are cleared, and one execution converts every VM
+        # in the resource group anyway. So importing more VMs from the same
+        # blueprint is the normal case, not a re-conversion.
+        state = shift.blueprint_execution_state(bp)
+
+        if state && state[:complete]
+            shift_already_converted(bp, options)
+            return
+        elsif state && state[:running]
+            puts "Blueprint '#{bp}' is already executing (#{state[:status]}); waiting for it."
+            status = shift.wait_for_completion(bp, state[:execution_id],
+                                               :timeout => options[:shift_wait_timeout])
+            puts "Shift blueprint '#{bp}' finished: #{status[:status]}".green
+            return
+        elsif state && state[:failed]
+            raise "Blueprint '#{bp}' last execution failed (#{state[:status]}). "\
+                  'Inspect and clear it in the Shift UI before retrying.'
+        end
+
         puts "Running Shift compliance check for blueprint '#{bp}'..."
         shift.check!(shift.run_compliance_check(bp))
 
         puts "Triggering Shift blueprint execution (#{NetAppShift::Helper::CONVERSION})..."
-        trigger = shift.check!(shift.trigger_migration(bp))
+        trigger = shift.trigger_migration(bp)
+
+        # Shift rejects a second execution of a blueprint that already
+        # converted (ERSCSTEX009). The disks are on the datastore, so that is
+        # a no-op for us, not an error.
+        if trigger[:already_executed]
+            shift_already_converted(bp, options)
+            return
+        end
+
+        shift.check!(trigger)
+
         exec_id = trigger[:execution_id]
         raise 'Shift accepted the blueprint execution but reported no execution id' if exec_id.nil?
 
@@ -3920,6 +3951,15 @@ GUESTFISH
         puts "Shift blueprint '#{bp}' finished: #{status[:status]}".green
     rescue NetAppShift::Error => e
         raise e.message
+    end
+
+    # Report that a blueprint's conversion is already done and its disks are
+    # being reused rather than regenerated.
+    def shift_already_converted(blueprint, options)
+        puts "Blueprint '#{blueprint}' has already been converted.".green
+        puts "Reusing the existing qcow2 disks on #{options[:shift_mount]}."
+        puts 'To convert again, clear the blueprint execution in the Shift UI '\
+             '(or with removeBpJobs.ps1) and re-run.'
     end
 
     # Shared NetAppShift::Helper constructor for the shift_* entry points.

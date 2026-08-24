@@ -1,3 +1,6 @@
+# Values here are defaults. Anything passed on the command line overrides
+# them, so per-VM customisations do not require editing this file.
+
 # OpenNebula Transfer Options, required for remote OpenNebula server
 #:http_transfer: false                    # Enable HTTP transfer
 #:http_host: '192.168.0.10'               # Hostname of this server
@@ -17,8 +20,7 @@
 #:esxi_pass: 'changeme123'                # ESXi password. Also used by delta prepare/commit when passwordless SSH is not available.
 
 # NetApp Shift Options
-# Note: like every key here, an uncommented value overrides the command line;
-# an uncommented :shift: forces Shift mode for every convert run.
+# Note: an uncommented :shift: puts every convert run into Shift mode.
 #:shift: 'https://172.20.0.124'           # Shift Toolkit appliance URL (scheme and host, no port)
 #:shift_user: 'admin'                     # Shift username
 #:shift_pass: 'changeme123'               # Shift password
@@ -84,7 +86,7 @@
 #:uefi_sec_path: '/usr/share/OVMF/OVMF_CODE.secboot.fd'     # Path to the UEFI Secure file to be configured in the VM template.
 
 # Logging Options
-#:verbose: true                           # Verbose mode: log at DEBUG and echo diagnostics to the terminal (STDERR) as well as /var/log/one/oneswap.log. Equivalent to the -v/--verbose flag or the ONE_SWAP_DEBUG env var. Note: like every option here, an uncommented value takes precedence over the command line.
+#:verbose: true                           # Verbose mode: log at DEBUG and echo diagnostics to the terminal (STDERR) as well as /var/log/one/oneswap.log. Equivalent to the -v/--verbose flag or the ONE_SWAP_DEBUG env var.
 
 # OpenNebula Placement Options
 #:one_cluster:                            # ID of the OpenNebula Cluster
