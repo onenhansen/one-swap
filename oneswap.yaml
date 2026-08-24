@@ -28,7 +28,6 @@
 #:shift_blueprint: 'bp-name'              # Pre-created blueprint (DR plan) to execute; one run converts every VM in it
 #:shift_skip_conversion: false            # Skip compliance/trigger/wait and import qcow2 disks already on the mount
 #:shift_wait_timeout: 0                   # Max seconds to wait for the blueprint execution (0 waits until Ctrl+C)
-#:shift_script_dir:                       # Override the shift-api-automation/Python scripts directory
 
 # Transfer Options
 #:custom_convert:                         # Uses OpenNebula's custom conversion process, useful for distributions which are not supported or fail to convert

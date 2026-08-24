@@ -163,8 +163,7 @@ Prerequisites, all created in the Shift UI beforehand:
 - The source NFS datastore mounted locally on the OneSwap host
   (`--shift-mount`); Shift writes `<vm-name>.qcow2` (plus
   `<vm-name>_1.qcow2`, ... for additional disks) next to each VM folder.
-- `virt-v2v-in-place` installed, and the Python dependencies of the vendored
-  shift-api-automation scripts (`pip install requests envyaml pymongo`).
+- `virt-v2v-in-place` installed on the conversion host.
 - Source VMs powered off.
 
 ```

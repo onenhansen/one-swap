@@ -3916,11 +3916,11 @@ GUESTFISH
         if state && state[:complete]
             shift_already_converted(bp, options)
             return
-        elsif state && state[:running]
+        elsif state && state[:running] && state[:execution_id]
             puts "Blueprint '#{bp}' is already executing (#{state[:status]}); waiting for it."
-            status = shift.wait_for_completion(bp, state[:execution_id],
-                                               :timeout => options[:shift_wait_timeout])
-            puts "Shift blueprint '#{bp}' finished: #{status[:status]}".green
+            shift.wait_for_completion(bp, state[:execution_id],
+                                      :timeout => options[:shift_wait_timeout])
+            puts "Shift blueprint '#{bp}' finished.".green
             return
         elsif state && state[:failed]
             raise "Blueprint '#{bp}' last execution failed (#{state[:status]}). "\
@@ -3928,27 +3928,22 @@ GUESTFISH
         end
 
         puts "Running Shift compliance check for blueprint '#{bp}'..."
-        shift.check!(shift.run_compliance_check(bp))
+        shift.run_compliance_check(bp)
 
-        puts "Triggering Shift blueprint execution (#{NetAppShift::Helper::CONVERSION})..."
-        trigger = shift.trigger_migration(bp)
-
-        # Shift rejects a second execution of a blueprint that already
-        # converted (ERSCSTEX009). The disks are on the datastore, so that is
-        # a no-op for us, not an error.
-        if trigger[:already_executed]
+        puts 'Triggering Shift blueprint execution (convert)...'
+        begin
+            exec_id = shift.trigger_conversion(bp)
+        rescue NetAppShift::AlreadyExecuted
+            # Shift refuses a second execution of a blueprint that already
+            # converted. The disks are on the datastore, so that is a no-op
+            # for us, not an error.
             shift_already_converted(bp, options)
             return
         end
 
-        shift.check!(trigger)
-
-        exec_id = trigger[:execution_id]
-        raise 'Shift accepted the blueprint execution but reported no execution id' if exec_id.nil?
-
         puts "Waiting for Shift execution #{exec_id} to complete (Ctrl+C to abort)..."
-        status = shift.wait_for_completion(bp, exec_id, :timeout => options[:shift_wait_timeout])
-        puts "Shift blueprint '#{bp}' finished: #{status[:status]}".green
+        shift.wait_for_completion(bp, exec_id, :timeout => options[:shift_wait_timeout])
+        puts "Shift blueprint '#{bp}' finished.".green
     rescue NetAppShift::Error => e
         raise e.message
     end
@@ -3965,11 +3960,10 @@ GUESTFISH
     # Shared NetAppShift::Helper constructor for the shift_* entry points.
     def new_netapp_shift(options)
         NetAppShift::Helper.new(
-            :server     => options[:shift],
-            :username   => options[:shift_user],
-            :password   => options[:shift_pass],
-            :script_dir => options[:shift_script_dir],
-            :logger     => @logger
+            :server   => options[:shift],
+            :username => options[:shift_user],
+            :password => options[:shift_pass],
+            :logger   => @logger
         )
     end
 

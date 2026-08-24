@@ -1,3 +1,0 @@
-[submodule "scripts/shift-api-automation"]
-	path = scripts/shift-api-automation
-	url = git@github.com:NetApp/shift-api-automation.git

@@ -924,12 +924,6 @@ CommandParser::CmdParser.new(ARGV) do
             options[:dry_run_source_benchmark_size_mib] ||= 1024
 
             if options[:shift]
-                # Installed layout: the submodule lands in SCRIPTS_LOCATION.
-                # From a repo checkout the helper falls back to its own
-                # __dir__-relative default when this stays nil.
-                shift_scripts = File.join(SCRIPTS_LOCATION, 'shift-api-automation', 'Python')
-                options[:shift_script_dir] ||= shift_scripts if Dir.exist?(shift_scripts)
-
                 # cleanup (and --delete) remove files under work_dir; the Shift
                 # mount holds the source datastore and must stay out of reach.
                 wd = File.expand_path(options[:work_dir])

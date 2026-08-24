@@ -175,7 +175,8 @@ class NetAppShiftModeTest < Minitest::Test
 
 end
 
-# Fake NetAppShift::Helper for orchestration tests
+# Fake NetAppShift::Helper for the orchestration tests. Mirrors the real
+# client's contract: reads return data, actions raise on failure.
 class FakeShift
 
     attr_reader :calls
@@ -185,35 +186,49 @@ class FakeShift
         @calls     = []
     end
 
-    def blueprint_execution_state(bp)
-        @calls << [:state, bp]
-        @responses.fetch(:state, nil)
+    def verbs
+        @calls.map(&:first)
     end
 
-    def run_compliance_check(bp)
-        @calls << [:compliance, bp]
-        @responses.fetch(:compliance)
+    def blueprint_execution_state(blueprint)
+        @calls << [:state, blueprint]
+        replay(:state, nil)
     end
 
-    def trigger_migration(bp)
-        @calls << [:trigger, bp]
-        @responses.fetch(:trigger)
+    def blueprint_vm_names(blueprint)
+        @calls << [:vm_names, blueprint]
+        replay(:vm_names)
     end
 
-    def wait_for_completion(bp, exec_id, timeout: nil)
-        @calls << [:wait, bp, exec_id, timeout]
-        @responses.fetch(:wait)
+    def run_compliance_check(blueprint)
+        @calls << [:compliance, blueprint]
+        replay(:compliance, {})
     end
 
-    def blueprint_vm_names(bp)
-        @calls << [:vm_names, bp]
-        @responses.fetch(:vm_names)
+    def trigger_conversion(blueprint)
+        @calls << [:trigger, blueprint]
+        replay(:trigger)
     end
 
-    def check!(result)
-        raise NetAppShift::OperationError, "failed: #{result.operation}" unless result.ok?
+    def wait_for_completion(blueprint, execution_id, timeout: nil)
+        @calls << [:wait, blueprint, execution_id, timeout]
+        replay(:wait, { :status => 'complete' })
+    end
 
-        result
+    private
+
+    # A stored exception is raised; anything else is returned.
+    def replay(key, default = :__required__)
+        value = @responses.fetch(key) do
+            raise "test: FakeShift has no :#{key} response" if default == :__required__
+
+            default
+        end
+
+        raise value if value.is_a?(Class) && value <= StandardError
+        raise value if value.is_a?(StandardError)
+
+        value
     end
 
 end
@@ -221,67 +236,108 @@ end
 class ShiftExecuteBlueprintTest < Minitest::Test
 
     OPTIONS = {
-        :shift            => 'https://shift.local',
-        :shift_user       => 'admin',
-        :shift_pass       => 'p',
-        :shift_blueprint  => 'bp1',
-        :shift_wait_timeout => 3600
+        :shift               => 'https://shift.local',
+        :shift_user          => 'admin',
+        :shift_pass          => 'p',
+        :shift_blueprint     => 'bp1',
+        :shift_mount         => '/mnt/shift',
+        :shift_wait_timeout  => 3600
     }.freeze
-
-    def result(op, data)
-        NetAppShift::Result.new(op, :data => data, :duration => 0.1)
-    end
 
     def orchestration_helper(fake)
         h = OneSwapHelper.allocate
         h.instance_variable_set(:@logger, Logger.new(File::NULL))
-        h.instance_variable_set(:@verbose, true) # short-circuit apply_verbosity
+        h.instance_variable_set(:@verbose, true) # short-circuits apply_verbosity
         h.define_singleton_method(:check_one_connectivity) { nil }
         h.define_singleton_method(:local_path_image_allocation_preflight!) { nil }
         h.define_singleton_method(:new_netapp_shift) {|_opts| fake }
         h
     end
 
-    def test_happy_path_passes_blueprint_execution_id_and_timeout
-        fake = FakeShift.new(
-            :compliance => result(:run_compliance_check, :ok => true),
-            :trigger    => result(:trigger_migration, :ok => true, :execution_id => 'ex-9'),
-            :wait       => result(:check_migration_status,
-                                  :ok => true, :status => 'convert_complete')
-        )
-        h = orchestration_helper(fake)
+    def run_it(fake)
+        capture_io { orchestration_helper(fake).shift_execute_blueprint(OPTIONS.dup) }
+    end
 
-        capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
+    def test_happy_path_passes_blueprint_execution_id_and_timeout
+        fake = FakeShift.new(:state => nil, :trigger => 'ex-9')
+
+        run_it(fake)
 
         assert_includes fake.calls, [:compliance, 'bp1']
         assert_includes fake.calls, [:trigger, 'bp1']
         assert_includes fake.calls, [:wait, 'bp1', 'ex-9', 3600]
     end
 
-    def test_missing_execution_id_raises
-        fake = FakeShift.new(
-            :compliance => result(:run_compliance_check, :ok => true),
-            :trigger    => result(:trigger_migration, :ok => true) # no execution_id
-        )
-        h = orchestration_helper(fake)
+    # The reported bug: a blueprint that already converted must not be
+    # triggered again, it must fall through to import.
+    def test_already_converted_state_skips_compliance_and_trigger
+        fake = FakeShift.new(:state => { :status => 'convert_complete', :complete => true,
+                                         :running => false, :failed => false,
+                                         :execution_id => 'ex-1' })
 
-        err = assert_raises(RuntimeError) do
-            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-        end
+        out, = run_it(fake)
 
-        assert_includes err.message, 'no execution id'
+        assert_equal [[:state, 'bp1']], fake.calls
+        assert_includes out, 'already been converted'
     end
 
-    def test_operation_error_becomes_plain_runtime_error
-        fake = FakeShift.new(:compliance => result(:run_compliance_check, :ok => false))
-        h = orchestration_helper(fake)
+    # And when the status endpoint does not report it, Shift's own rejection
+    # of the second execution must be treated the same way.
+    def test_already_executed_on_trigger_is_not_an_error
+        fake = FakeShift.new(:state => nil, :trigger => NetAppShift::AlreadyExecuted)
 
-        err = assert_raises(RuntimeError) do
-            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-        end
+        out, = run_it(fake)
 
-        refute_kind_of NetAppShift::OperationError, err
-        assert_includes err.message, 'run_compliance_check'
+        assert_includes out, 'already been converted'
+        refute_includes fake.verbs, :wait
+    end
+
+    def test_running_blueprint_attaches_to_existing_execution
+        fake = FakeShift.new(:state => { :status => 'convert_inprogress', :complete => false,
+                                         :running => true, :failed => false,
+                                         :execution_id => 'ex-7' })
+
+        run_it(fake)
+
+        assert_includes fake.calls, [:wait, 'bp1', 'ex-7', 3600]
+        refute_includes fake.verbs, :trigger
+        refute_includes fake.verbs, :compliance
+    end
+
+    def test_failed_blueprint_raises_without_triggering
+        fake = FakeShift.new(:state => { :status => 'convert_error', :complete => false,
+                                         :running => false, :failed => true,
+                                         :execution_id => 'ex-3' })
+
+        err = assert_raises(RuntimeError) { run_it(fake) }
+
+        assert_includes err.message, 'last execution failed'
+        refute_includes fake.verbs, :trigger
+    end
+
+    def test_compliance_failure_becomes_a_plain_error
+        fake = FakeShift.new(
+            :state      => nil,
+            :compliance => NetAppShift::OperationError.new('compliance check failed: nope')
+        )
+
+        err = assert_raises(RuntimeError) { run_it(fake) }
+
+        refute_kind_of NetAppShift::Error, err
+        assert_includes err.message, 'compliance check failed'
+        refute_includes fake.verbs, :trigger
+    end
+
+    def test_trigger_failure_propagates
+        fake = FakeShift.new(
+            :state   => nil,
+            :trigger => NetAppShift::OperationError.new('returned no execution id')
+        )
+
+        err = assert_raises(RuntimeError) { run_it(fake) }
+
+        assert_includes err.message, 'no execution id'
+        refute_includes fake.verbs, :wait
     end
 
     def test_blueprint_vm_names_delegates
@@ -289,96 +345,6 @@ class ShiftExecuteBlueprintTest < Minitest::Test
         h = orchestration_helper(fake)
 
         assert_equal %w[web01 db01], h.shift_blueprint_vm_names(OPTIONS.dup)
-    end
-
-    # The reported bug: a blueprint that already converted must not be
-    # triggered again (Shift rejects it), it must fall through to import.
-    def test_already_converted_blueprint_skips_compliance_and_trigger
-        fake = FakeShift.new(:state => { :status => 'convert_complete', :complete => true,
-                                         :running => false, :failed => false,
-                                         :execution_id => 'ex-1' })
-        h = orchestration_helper(fake)
-
-        out, = capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-
-        assert_equal [[:state, 'bp1']], fake.calls
-        assert_includes out, 'already been converted'
-    end
-
-    def test_running_blueprint_attaches_to_existing_execution
-        fake = FakeShift.new(
-            :state => { :status => 'convert_inprogress', :complete => false,
-                        :running => true, :failed => false, :execution_id => 'ex-7' },
-            :wait  => result(:check_migration_status, :ok => true,
-                             :status => 'convert_complete')
-        )
-        h = orchestration_helper(fake)
-
-        capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-
-        assert_includes fake.calls, [:wait, 'bp1', 'ex-7', 3600]
-        refute_includes fake.calls.map(&:first), :trigger
-        refute_includes fake.calls.map(&:first), :compliance
-    end
-
-    def test_failed_blueprint_raises_without_triggering
-        fake = FakeShift.new(:state => { :status => 'convert_error', :complete => false,
-                                         :running => false, :failed => true,
-                                         :execution_id => 'ex-3' })
-        h = orchestration_helper(fake)
-
-        err = assert_raises(RuntimeError) do
-            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-        end
-
-        assert_includes err.message, 'last execution failed'
-        refute_includes fake.calls.map(&:first), :trigger
-    end
-
-    # Safety net for when the status pre-check does not see the blueprint:
-    # Shift's own ERSCSTEX009 rejection must be treated as "already done",
-    # not as a failure.
-    def test_erscstex009_on_trigger_is_not_an_error
-        fake = FakeShift.new(
-            :state      => nil,
-            :compliance => result(:run_compliance_check, :ok => true),
-            :trigger    => result(:trigger_migration, :ok => false, :already_executed => true)
-        )
-        h = orchestration_helper(fake)
-
-        out, = capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-
-        assert_includes out, 'already been converted'
-        refute_includes fake.calls.map(&:first), :wait
-    end
-
-    def test_other_trigger_failures_still_raise
-        fake = FakeShift.new(
-            :state      => nil,
-            :compliance => result(:run_compliance_check, :ok => true),
-            :trigger    => result(:trigger_migration, :ok => false, :already_executed => false)
-        )
-        h = orchestration_helper(fake)
-
-        assert_raises(RuntimeError) do
-            capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-        end
-    end
-
-    def test_never_run_blueprint_still_triggers
-        fake = FakeShift.new(
-            :state      => nil,
-            :compliance => result(:run_compliance_check, :ok => true),
-            :trigger    => result(:trigger_migration, :ok => true, :execution_id => 'ex-9'),
-            :wait       => result(:check_migration_status, :ok => true,
-                                  :status => 'convert_complete')
-        )
-        h = orchestration_helper(fake)
-
-        capture_io { h.shift_execute_blueprint(OPTIONS.dup) }
-
-        assert_includes fake.calls, [:compliance, 'bp1']
-        assert_includes fake.calls, [:trigger, 'bp1']
     end
 
 end
