@@ -687,14 +687,45 @@ CommandParser::CmdParser.new(ARGV) do
                         'disks already present on --shift-mount (re-runs and recovery).'
     }
 
+    SHIFT_SKIP_COMPLIANCE = {
+        :name  => 'shift_skip_compliance',
+        :large => '--shift-skip-compliance',
+        :description => 'Skip the Shift compliance check but still trigger the blueprint. '\
+                        'Useful when it has already been checked, or when resuming.'
+    }
+
+    SHIFT_SKIP_MORPH = {
+        :name  => 'shift_skip_morph',
+        :large => '--shift-skip-morph',
+        :description => 'Import the converted disks without running virt-v2v-in-place. '\
+                        'For guests virt-v2v cannot convert (Alpine and other minimal '\
+                        'distributions) that already carry virtio drivers and boot under KVM.'
+    }
+
+    SHIFT_IGNORE_RUNNING_VMS = {
+        :name  => 'shift_ignore_running_vms',
+        :large => '--shift-ignore-running-vms',
+        :description => 'Convert even if VMs in the blueprint are still powered on. '\
+                        'Shift takes a point-in-time snapshot, so the resulting disks are '\
+                        'crash-consistent rather than quiesced.'
+    }
+
     SHIFT_OPTS = [SHIFT, SHIFT_USER, SHIFT_PASS, SHIFT_MOUNT, SHIFT_BLUEPRINT,
-                  SHIFT_SKIP_CONVERSION]
+                  SHIFT_SKIP_CONVERSION, SHIFT_SKIP_COMPLIANCE, SHIFT_SKIP_MORPH,
+                  SHIFT_IGNORE_RUNNING_VMS]
 
     ESXI_OPTS = [ESXI, ESXI_USER, ESXI_PASS]
     V2V_OPTS = [V2V_PATH, LIBGUESTFS_PATH, WORK_DIR, FORMAT, VIRTIO, WIN_GA, LNX_GA, DELETE, VDDK, RHSRVANY, ROOT]
     HTTP_OPTS = [HTTP_TRANSFER, HTTP_HOST, HTTP_PORT, ALLOW_LOCAL_PATH_REMOTE]
 
-    LIST_OPTS    = [NAME, DATACENTER, CLUSTER, STATE, ACCEPT_CERT] + AUTH_OPTS
+    # Listing from Shift needs the appliance and a blueprint, but none of the
+    # conversion-side options (mount, skip-conversion).
+    SHIFT_LIST_OPTS = [SHIFT, SHIFT_USER, SHIFT_PASS, SHIFT_BLUEPRINT]
+
+    # CLIHelper::SIZE is deliberately left out: its short flag is -s, which is
+    # already the short flag for --state above.
+    LIST_OPTS    = [NAME, DATACENTER, CLUSTER, STATE, ACCEPT_CERT,
+                    CLIHelper::EXPAND, CLIHelper::NO_EXPAND] + AUTH_OPTS + SHIFT_LIST_OPTS
     CONVERT_OPTS = [NETWORK, NO_IP, NO_MAC, DATASTORE, CONTEXT, FALLBACK, CUSTOM, HYBRID, DOWNLOAD_STRIPES, DELTA, DELTA_PREPARE, DELTA_COMMIT, DELTA_CLEANUP, DRY_RUN, BENCHMARK_IMPORT, BENCHMARK_EXPORT, V2V_PATH, CONF_FILE, IMG_WAIT, DEV_PREFIX,
                     CPU_MODEL, GRAPHICS_TYPE, GRAPHICS_LISTEN, GRAPHICS_PORT, GRAPHICS_KEYMAP, GRAPHICS_PASSWORD, GRAPHICS_COMMAND, DISABLE_CONTEXTUALIZATION,
                     PERSISTENT_IMG, MEMORY_MAX, VCPU_MAX, CPU, VCPU, ONE_DS, ONE_DS_CLUSTER, ONE_CLUSTER, ONE_HOST, CLONE, REMOVE_VMTOOLS,
@@ -722,6 +753,15 @@ CommandParser::CmdParser.new(ARGV) do
            - listing available vms in a Datacenter and Cluster:
 
              oneswap list vms --datacenter DCName --cluster Cluster2
+
+           - listing the NetApp Shift blueprints available to convert:
+
+             SOPTS='--shift https://12.34.56.80 --shift-user admin --shift-pass changeme123'
+             oneswap list blueprints $SOPTS
+
+           - listing the VMs a blueprint covers, which is what it will convert:
+
+             oneswap list vms $SOPTS --shift-blueprint bp1
 
     EOT
 
@@ -899,6 +939,14 @@ CommandParser::CmdParser.new(ARGV) do
 
                 if !system('which virt-v2v-in-place > /dev/null 2>&1')
                     raise '--shift requires virt-v2v-in-place; install virt-v2v.'
+                end
+
+                # vCenter still supplies the VM properties, NICs and tags the
+                # template is built from. Check it here rather than letting the
+                # run get all the way past a blueprint execution before failing.
+                if !options[:vcenter] || !options[:vuser]
+                    raise 'Shift conversions still read VM properties from vCenter. '\
+                          'Provide --vcenter and --vuser (and --vpass).'
                 end
             end
 

@@ -23,11 +23,7 @@ require 'uri'
 # NetApp Shift Toolkit client for OneSwap.
 #
 # Talks to the Shift appliance REST API directly. The endpoints, ports and
-# payloads mirror NetApp's own shift-api-automation Python modules, which this
-# replaced -- those scripts are not a library (each reads a fixed JSON file
-# next to itself and reports results only by logging to stderr), and the six
-# endpoints OneSwap needs are thin enough that wrapping them in Ruby is less
-# code than driving the scripts as subprocesses.
+# payloads mirror NetApp's own shift-api-automation Python modules.
 #
 # Services live on three ports:
 #
@@ -80,26 +76,71 @@ module NetAppShift
     # OneSwap stays read-only against that API.
     class AlreadyExecuted < OperationError; end
 
+    # Shift refuses to convert while any VM in the blueprint is running,
+    # unless the caller opts in to a point-in-time snapshot of the live VM.
+    # Carries the names the appliance reported so the caller can act on them.
+    class PoweredOnVms < OperationError
+
+        attr_reader :vm_names
+
+        def initialize(message = nil, code: nil, http_status: nil, vm_names: [])
+            super(message, :code => code, :http_status => http_status)
+            @vm_names = vm_names
+        end
+
+    end
+
     class Helper
 
         SESSION_PORT  = 3698
         SETUP_PORT    = 3700
         RECOVERY_PORT = 3704
 
-        # Execution types. "convert" is the disk-only workflow OneSwap wants:
-        # it converts the VMDKs on the ONTAP volume without building a VM on
-        # the target hypervisor. "migrate" additionally creates and configures
-        # the target VM.
+        # The only execution type OneSwap uses. Shift also offers "migrate",
+        # which builds a VM on the destination hypervisor -- not possible here,
+        # because the destination is a qcow2 on an NFS export rather than a
+        # hypervisor Shift can drive.
         CONVERSION = 'convert'.freeze
-        MIGRATION  = 'migrate'.freeze
 
-        # Job step states. Everything else means the step is still pending or
-        # running.
-        STEP_SUCCESS = 4
-        STEP_FAILED  = 5
+        # Terminal states, shared by job steps and executions. Everything else
+        # means still pending or running.
+        STATE_SUCCESS = 4
+        STATE_FAILED  = 5
+
+        # API paths. Collected here because the appliance is inconsistent
+        # about casing -- the status collection is "drplan", the per-plan
+        # execution path is "drPlan". Both are verified against a live
+        # appliance; neither is a typo to be "corrected".
+        PATH_SITES            = '/api/setup/site'.freeze
+        PATH_BLUEPRINTS       = '/api/setup/drplan'.freeze
+        PATH_RESOURCE_GROUPS  = '/api/setup/protectionGroup'.freeze
+        PATH_BLUEPRINT_STATUS = '/api/recovery/drplan/status'.freeze
+
+        def self.path_compliance_request(blueprint_id)
+            "/api/setup/compliance/drplan/#{blueprint_id}/checkrequest?async=true"
+        end
+
+        # The task id goes in both the path and the query string; that is what
+        # the appliance expects, odd as it reads.
+        def self.path_compliance_status(task_id)
+            "/api/setup/compliance/drplan/#{task_id}/checkrequest?taskId=#{task_id}"
+        end
+
+        def self.path_execution(blueprint_id, mode)
+            "/api/recovery/drPlan/#{blueprint_id}/#{mode}/execution"
+        end
+
+        def self.path_execution_steps(execution_id)
+            "/api/recovery/execution/#{execution_id}/steps"
+        end
 
         # Returned when a blueprint has already been executed successfully.
         ERR_ALREADY_EXECUTED = 'ERSCSTEX009'.freeze
+
+        # Returned when a VM in the blueprint is still running. Overridable
+        # with the ignorePoweredOnVms flag, which is what the Shift UI sends
+        # when its "Continue" prompt is accepted.
+        ERR_VMS_POWERED_ON = 'ERSCSTEX022'.freeze
 
         DEFAULTS = {
             # Per-request socket timeouts.
@@ -150,50 +191,99 @@ module NetAppShift
         # Sites registered on the appliance. Cheap connectivity and credential
         # preflight.
         def sites
-            api_session {|sid| api_list(sid, SETUP_PORT, '/api/setup/site') }
+            api_session {|sid| api_list(sid, SETUP_PORT, PATH_SITES) }
         end
 
         # Blueprints registered on the appliance.
         def blueprints
-            api_session {|sid| api_list(sid, SETUP_PORT, '/api/setup/drplan') }
+            api_session {|sid| api_list(sid, SETUP_PORT, PATH_BLUEPRINTS) }
         end
 
-        # VM names a blueprint covers, in resource-group order. This is what
-        # one execution of it will convert.
+        # VMs a blueprint covers, in resource-group order. This is what one
+        # execution of it will convert.
         #
-        # @return [Array<String>]
-        def blueprint_vm_names(blueprint_name)
+        # @return [Array<Hash>] :name, :id, :resource_group
+        def blueprint_vms(blueprint_name)
             api_session do |sid|
                 blueprint = find_blueprint(sid, blueprint_name)
 
                 rg_ids = Array(blueprint['protectionGroups']).map {|rg| rg['_id'] }.compact
-                groups = api_list(sid, SETUP_PORT, '/api/setup/protectionGroup')
+                groups = api_list(sid, SETUP_PORT, PATH_RESOURCE_GROUPS)
                          .select {|rg| rg_ids.include?(rg['_id']) }
 
-                names = groups.flat_map {|rg| Array(rg['vms']).map {|vm| vm['name'] } }.compact
+                vms = groups.flat_map do |rg|
+                    Array(rg['vms']).map do |vm|
+                        # Logged so the fields the appliance actually returns
+                        # can be surfaced as columns without guessing at them.
+                        @logger.debug("NetApp Shift: blueprint VM -> #{vm.inspect}")
 
-                if names.empty?
+                        { :name           => vm['name'],
+                          :id             => vm['_id'],
+                          :resource_group => rg['name'] }
+                    end
+                end.reject {|vm| vm[:name].nil? }
+
+                if vms.empty?
                     raise OperationError,
                           "Blueprint '#{blueprint_name}' has no VMs in its resource group(s)"
                 end
 
-                names
+                vms
+            end
+        end
+
+        # Just the names, in the same order.
+        #
+        # @return [Array<String>]
+        def blueprint_vm_names(blueprint_name)
+            blueprint_vms(blueprint_name).map {|vm| vm[:name] }
+        end
+
+        # Every blueprint on the appliance with the resource groups and VMs it
+        # covers, for choosing which one to run.
+        #
+        # @return [Array<Hash>] :name, :id, :resource_groups, :vms
+        def blueprint_summaries
+            api_session do |sid|
+                by_id = api_list(sid, SETUP_PORT, PATH_RESOURCE_GROUPS)
+                        .each_with_object({}) {|rg, acc| acc[rg['_id']] = rg }
+
+                api_list(sid, SETUP_PORT, PATH_BLUEPRINTS).map do |bp|
+                    groups = Array(bp['protectionGroups']).map {|rg| by_id[rg['_id']] }.compact
+
+                    {
+                        :name            => bp['name'],
+                        :id              => bp['_id'],
+                        :resource_groups => groups.map {|rg| rg['name'] }.compact,
+                        :vms             => groups.flat_map do |rg|
+                            Array(rg['vms']).map {|vm| vm['name'] }
+                        end.compact
+                    }
+                end
             end
         end
 
         # Whether a blueprint has already run, is running, or failed -- nil if
         # it has never run or the appliance does not list it.
         #
-        # Best effort, and only an optimisation: it saves a pointless
-        # compliance check and trigger. The reliable signal that a blueprint
-        # cannot run again is the AlreadyExecuted raised by
-        # #trigger_conversion.
+        # Read from the blueprint's lastExecution, which carries a numeric
+        # status and the execution type:
         #
-        # @return [Hash, nil] :status, :execution_id, :complete, :failed, :running
+        #   {"drPlan" => {"_id" => .., "name" => ..},
+        #    "lastExecution" => {"_id" => .., "status" => 4, "type" => "convert"}}
+        #
+        # (NetApp's own client read a "recoveryStatus" string off drPlan
+        # instead; appliances in the field do not return that field.)
+        #
+        # Still only an optimisation -- it saves a pointless compliance check
+        # and trigger. The reliable signal that a blueprint cannot run again
+        # is the AlreadyExecuted raised by #trigger_conversion.
+        #
+        # @return [Hash, nil] :status, :type, :execution_id, :complete, :failed, :running
         def blueprint_execution_state(blueprint_name)
             api_session do |sid|
                 id       = find_blueprint(sid, blueprint_name)['_id']
-                response = api_get(sid, RECOVERY_PORT, '/api/recovery/drplan/status')
+                response = api_get(sid, RECOVERY_PORT, PATH_BLUEPRINT_STATUS)
 
                 @logger.debug("NetApp Shift: drplan/status -> #{response.inspect}")
 
@@ -207,28 +297,34 @@ module NetAppShift
                     next nil
                 end
 
-                status = entry.dig('drPlan', 'recoveryStatus').to_s
+                last = entry['lastExecution']
 
-                next nil if status.empty?
+                if last.nil?
+                    @logger.debug("NetApp Shift: blueprint #{id} has no lastExecution")
+                    next nil
+                end
+
+                status = last['status']
 
                 {
                     :status       => status,
-                    :execution_id => entry.dig('lastExecution', '_id'),
-                    :complete     => status.include?('complete'),
-                    :failed       => status.include?('error'),
-                    :running      => !status.match?(/complete|error/)
+                    :type         => last['type'],
+                    :execution_id => last['_id'],
+                    :complete     => status == STATE_SUCCESS,
+                    :failed       => status == STATE_FAILED,
+                    :running      => ![STATE_SUCCESS, STATE_FAILED].include?(status)
                 }
             end
         end
 
         # Job steps of an execution. Each carries a 'description' and a
-        # 'status' (see STEP_SUCCESS / STEP_FAILED).
+        # 'status' (see STATE_SUCCESS / STATE_FAILED).
         #
         # @return [Array<Hash>]
         def job_steps(execution_id)
             api_session do |sid|
                 response = api_get(sid, RECOVERY_PORT,
-                                   "/api/recovery/execution/#{execution_id}/steps")
+                                   self.class.path_execution_steps(execution_id))
 
                 Array(response['steps'])
             end
@@ -301,7 +397,7 @@ module NetAppShift
                 id = find_blueprint(sid, blueprint_name)['_id']
 
                 started = api_post(sid, SETUP_PORT,
-                                   "/api/setup/compliance/drplan/#{id}/checkrequest?async=true",
+                                   self.class.path_compliance_request(id),
                                    :timeout => @timeouts[:compliance_timeout])
 
                 task_id = started['taskId']
@@ -320,9 +416,14 @@ module NetAppShift
         # Execute a blueprint. With CONVERSION this converts the disks only;
         # no VM is built on the target hypervisor.
         #
+        # @param ignore_powered_on [Boolean] convert from a point-in-time
+        #   snapshot even if VMs in the blueprint are running. This is the
+        #   override behind the Shift UI's "Continue" prompt; the resulting
+        #   image is crash-consistent, not quiesced.
         # @return [String] the execution id
         # @raise [AlreadyExecuted] if the blueprint has already converted
-        def trigger_conversion(blueprint_name, mode = CONVERSION)
+        # @raise [PoweredOnVms] if VMs are running and the override is off
+        def trigger_conversion(blueprint_name, ignore_powered_on: false)
             api_session do |sid|
                 id = find_blueprint(sid, blueprint_name)['_id']
 
@@ -333,10 +434,12 @@ module NetAppShift
                     }
                 }
 
-                # Note the capital P: this path is drPlan, unlike the lowercase
-                # drplan of /api/recovery/drplan/status.
+                # Only added when asked for, so the default request stays
+                # byte-identical to the one already known to work.
+                payload['ignorePoweredOnVms'] = true if ignore_powered_on
+
                 response = api_post(sid, RECOVERY_PORT,
-                                    "/api/recovery/drPlan/#{id}/#{mode}/execution",
+                                    self.class.path_execution(id, CONVERSION),
                                     :body => payload)
 
                 execution_id = response['_id'] || deep_find(response, '_id')
@@ -373,7 +476,7 @@ module NetAppShift
                 when :complete
                     return { :status => 'complete', :steps => steps }
                 when :failed
-                    failed = steps.select {|s| s['status'] == STEP_FAILED }
+                    failed = steps.select {|s| s['status'] == STATE_FAILED }
                                   .map {|s| s['description'] }.compact
                     raise OperationError,
                           "Shift execution #{execution_id} of '#{blueprint_name}' failed" \
@@ -402,8 +505,8 @@ module NetAppShift
 
             statuses = steps.map {|s| s['status'] }
 
-            return :failed   if statuses.include?(STEP_FAILED)
-            return :complete if statuses.all? {|s| s == STEP_SUCCESS }
+            return :failed   if statuses.include?(STATE_FAILED)
+            return :complete if statuses.all? {|s| s == STATE_SUCCESS }
 
             :running
         end
@@ -413,17 +516,20 @@ module NetAppShift
             interval = @timeouts[:compliance_poll_interval].to_f
 
             limit.times do
-                # The task id goes in both the path and the query string; that
-                # is what the appliance expects, odd as it reads.
                 response = api_post(session_id, SETUP_PORT,
-                                    "/api/setup/compliance/drplan/#{task_id}" \
-                                    "/checkrequest?taskId=#{task_id}",
+                                    self.class.path_compliance_status(task_id),
                                     :timeout => @timeouts[:compliance_timeout])
 
                 status = response['status'].to_s
 
-                return { :task_id => task_id, :result => response['result'] } if
-                    status == 'succeeded'
+                if status == 'succeeded'
+                    # The result carries the appliance's per-check findings.
+                    # Logged rather than discarded so a check that "passed"
+                    # but flagged something is still visible.
+                    @logger.debug("NetApp Shift: compliance result -> #{response['result'].inspect}")
+
+                    return { :task_id => task_id, :result => response['result'] }
+                end
 
                 if ['failed', 'error'].include?(status)
                     raise OperationError,
@@ -441,7 +547,7 @@ module NetAppShift
         end
 
         def find_blueprint(session_id, blueprint_name)
-            all       = api_list(session_id, SETUP_PORT, '/api/setup/drplan')
+            all       = api_list(session_id, SETUP_PORT, PATH_BLUEPRINTS)
             blueprint = all.find {|bp| bp['name'] == blueprint_name }
 
             if blueprint.nil?
@@ -558,7 +664,11 @@ module NetAppShift
                 nil
             end
 
-            detail = parsed.is_a?(Hash) ? (Array(parsed['errors']).first || parsed) : nil
+            # The appliance's top-level "message" is often the literal string
+            # "[object Object]", so the first entry of "errors" is the one
+            # worth reading. Later entries carry structured detail instead.
+            errors  = parsed.is_a?(Hash) ? Array(parsed['errors']).select {|e| e.is_a?(Hash) } : []
+            detail  = errors.first || (parsed.is_a?(Hash) ? parsed : nil)
             code    = detail.is_a?(Hash) ? detail['code'] : nil
             message = (detail.is_a?(Hash) && detail['message']) ||
                       response.body.to_s[0, 300]
@@ -567,6 +677,15 @@ module NetAppShift
                 raise AlreadyExecuted.new(message.to_s,
                                           :code => code,
                                           :http_status => response.code.to_i)
+            end
+
+            if code == ERR_VMS_POWERED_ON
+                raise PoweredOnVms.new(
+                    message.to_s,
+                    :code        => code,
+                    :http_status => response.code.to_i,
+                    :vm_names    => errors.flat_map {|e| Array(e['poweredOnVmNames']) }.compact.uniq
+                )
             end
 
             raise OperationError.new(

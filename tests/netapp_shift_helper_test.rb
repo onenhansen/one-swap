@@ -166,6 +166,39 @@ class BlueprintVmNamesTest < Minitest::Test
         assert_includes fake.paths, '/api/tenant/session/end'
     end
 
+    def test_blueprint_vms_carry_their_resource_group
+        helper, = helper_with(SETUP_ROUTES)
+
+        assert_equal [{ :name => 'web01', :id => 'vm-1', :resource_group => 'group1' },
+                      { :name => 'web02', :id => 'vm-2', :resource_group => 'group1' },
+                      { :name => 'db01',  :id => 'vm-3', :resource_group => 'group2' }],
+                     helper.blueprint_vms('waves')
+    end
+
+    def test_blueprint_summaries_join_groups_and_vms
+        helper, = helper_with(SETUP_ROUTES)
+        summaries = helper.blueprint_summaries
+
+        assert_equal %w[multidisk waves], summaries.map {|bp| bp[:name] }
+
+        waves = summaries.find {|bp| bp[:name] == 'waves' }
+        assert_equal %w[group1 group2], waves[:resource_groups]
+        assert_equal %w[web01 web02 db01], waves[:vms]
+
+        # the unrelated group is not attached to any blueprint
+        refute_includes summaries.flat_map {|bp| bp[:vms] }, 'other'
+    end
+
+    def test_blueprint_summaries_survive_a_dangling_group_reference
+        blueprints = { 'list' => [{ '_id' => 'bp-x', 'name' => 'stale',
+                                    'protectionGroups' => [{ '_id' => 'gone' }] }] }
+        helper, = helper_with(SETUP_ROUTES.merge('/api/setup/drplan' => blueprints))
+
+        assert_equal [{ :name => 'stale', :id => 'bp-x',
+                        :resource_groups => [], :vms => [] }],
+                     helper.blueprint_summaries
+    end
+
     def test_session_is_reused_not_reopened
         helper, fake = helper_with(SETUP_ROUTES)
         helper.blueprint_vm_names('multidisk')
@@ -179,37 +212,38 @@ end
 
 class BlueprintExecutionStateTest < Minitest::Test
 
-    def entry(recovery_status, exec_id = 'ex-1', bp_id = 'bp-1')
-        { 'drPlan'        => { '_id' => bp_id, 'recoveryStatus' => recovery_status },
-          'lastExecution' => { '_id' => exec_id } }
+    # Verbatim shape from a live appliance. Note there is no "recoveryStatus"
+    # on drPlan -- the state lives on lastExecution.
+    def entry(exec_status, exec_id = 'ex-1', bp_id = 'bp-1', type = 'convert')
+        {
+            'drPlan'        => { '_id' => bp_id, 'name' => 'multidisk',
+                                 'activeSite' => 'source', 'vmSuccessCount' => 0 },
+            'lastExecution' => exec_status.nil? ? nil : { '_id' => exec_id,
+                                                          'status' => exec_status,
+                                                          'type' => type },
+            'lastPrepareVmExecution' => nil
+        }
     end
 
     def state_helper(status_body)
-        helper_with(SETUP_ROUTES.merge('/api/recovery/drplan/status' => status_body))
+        helper_with(SETUP_ROUTES.merge(NetAppShift::Helper::PATH_BLUEPRINT_STATUS => status_body))
     end
 
     def test_completed_conversion
-        helper, fake = state_helper([entry('convert_complete')])
+        helper, fake = state_helper([entry(NetAppShift::Helper::STATE_SUCCESS)])
         state = helper.blueprint_execution_state('multidisk')
 
         assert state[:complete]
         refute state[:running]
         refute state[:failed]
         assert_equal 'ex-1', state[:execution_id]
+        assert_equal 'convert', state[:type]
         assert_equal NetAppShift::Helper::RECOVERY_PORT,
-                     fake.find('/api/recovery/drplan/status')[:port]
-    end
-
-    def test_running_execution
-        helper, = state_helper([entry('convert_inprogress')])
-        state = helper.blueprint_execution_state('multidisk')
-
-        assert state[:running]
-        refute state[:complete]
+                     fake.find(NetAppShift::Helper::PATH_BLUEPRINT_STATUS)[:port]
     end
 
     def test_failed_execution
-        helper, = state_helper([entry('convert_error')])
+        helper, = state_helper([entry(NetAppShift::Helper::STATE_FAILED)])
         state = helper.blueprint_execution_state('multidisk')
 
         assert state[:failed]
@@ -217,13 +251,23 @@ class BlueprintExecutionStateTest < Minitest::Test
         refute state[:running]
     end
 
-    def test_absent_blueprint_returns_nil
-        helper, = state_helper([entry('convert_complete', 'ex-9', 'bp-other')])
+    def test_in_flight_execution_is_running
+        helper, = state_helper([entry(2)])
+        state = helper.blueprint_execution_state('multidisk')
+
+        assert state[:running]
+        refute state[:complete]
+        refute state[:failed]
+        assert_equal 'ex-1', state[:execution_id]
+    end
+
+    def test_never_executed_returns_nil
+        helper, = state_helper([entry(nil)])
         assert_nil helper.blueprint_execution_state('multidisk')
     end
 
-    def test_empty_status_returns_nil
-        helper, = state_helper([entry('')])
+    def test_absent_blueprint_returns_nil
+        helper, = state_helper([entry(NetAppShift::Helper::STATE_SUCCESS, 'ex-9', 'bp-other')])
         assert_nil helper.blueprint_execution_state('multidisk')
     end
 
@@ -233,12 +277,12 @@ class BlueprintExecutionStateTest < Minitest::Test
     end
 
     def test_tolerates_list_envelope
-        helper, = state_helper('list' => [entry('convert_complete')])
+        helper, = state_helper('list' => [entry(NetAppShift::Helper::STATE_SUCCESS)])
         assert helper.blueprint_execution_state('multidisk')[:complete]
     end
 
     def test_tolerates_junk_entries
-        helper, = state_helper(['nonsense', nil, entry('convert_complete')])
+        helper, = state_helper(['nonsense', nil, entry(NetAppShift::Helper::STATE_SUCCESS)])
         assert helper.blueprint_execution_state('multidisk')[:complete]
     end
 
@@ -246,8 +290,8 @@ end
 
 class ExecutionStatusTest < Minitest::Test
 
-    S = NetAppShift::Helper::STEP_SUCCESS
-    F = NetAppShift::Helper::STEP_FAILED
+    S = NetAppShift::Helper::STATE_SUCCESS
+    F = NetAppShift::Helper::STATE_FAILED
 
     def status_for(body)
         helper, = helper_with(%r{/api/recovery/execution/.*/steps} => body)
@@ -281,8 +325,8 @@ end
 
 class WaitForCompletionTest < Minitest::Test
 
-    S = NetAppShift::Helper::STEP_SUCCESS
-    F = NetAppShift::Helper::STEP_FAILED
+    S = NetAppShift::Helper::STATE_SUCCESS
+    F = NetAppShift::Helper::STATE_FAILED
 
     def waiter(*bodies)
         helper_with(%r{/api/recovery/execution/.*/steps} => sequence(*bodies))
@@ -411,11 +455,20 @@ class TriggerConversionTest < Minitest::Test
                      fake.find('/execution')[:body]['serviceAccounts'])
     end
 
-    def test_migrate_mode_uses_the_migrate_path
+    # The default request must stay exactly as it is today; the override is
+    # only sent when explicitly asked for.
+    def test_powered_on_override_is_absent_by_default
         helper, fake = trigger_helper('_id' => 'ex-77')
-        helper.trigger_conversion('multidisk', NetAppShift::Helper::MIGRATION)
+        helper.trigger_conversion('multidisk')
 
-        assert_includes fake.paths, '/api/recovery/drPlan/bp-1/migrate/execution'
+        refute fake.find('/execution')[:body].key?('ignorePoweredOnVms')
+    end
+
+    def test_powered_on_override_is_sent_when_requested
+        helper, fake = trigger_helper('_id' => 'ex-77')
+        helper.trigger_conversion('multidisk', :ignore_powered_on => true)
+
+        assert_equal true, fake.find('/execution')[:body]['ignorePoweredOnVms']
     end
 
     def test_finds_a_nested_execution_id
@@ -474,6 +527,45 @@ class ApiErrorTranslationTest < Minitest::Test
         body = { 'message' => 'No further execution is allowed.' }
 
         assert_raises(NetAppShift::AlreadyExecuted) { raise_for('500', JSON.generate(body)) }
+    end
+
+    # Verbatim from a live appliance. Note the top-level message is their
+    # "[object Object]" bug, and the VM names live in a *second* error object.
+    ERSCSTEX022_BODY = {
+        'level'   => 'error',
+        'message' => '[object Object]',
+        'errors'  => [
+            {
+                'uid'     => 'c268a134-68f0-4fda-b22d-64731cd4df48',
+                'code'    => 'ERSCSTEX022',
+                'message' => "ERSCSTEX022: Cannot execute the 'convert' action - as some " \
+                             'VMs are still powered on. Powered on VMs - ' \
+                             'u2505-oneswap-test_netappshift,oneswap-shift-multidisk',
+                'level'   => 'error'
+            },
+            {
+                'executionType'     => 'convert',
+                'poweredOnVmNames'  => ['u2505-oneswap-test_netappshift',
+                                        'oneswap-shift-multidisk'],
+                'poweredOffVmNames' => [],
+                'code'              => '',
+                'message'           => '[object Object]'
+            }
+        ]
+    }.freeze
+
+    def test_powered_on_vms_is_its_own_error_carrying_the_names
+        err = assert_raises(NetAppShift::PoweredOnVms) do
+            raise_for('500', JSON.generate(ERSCSTEX022_BODY))
+        end
+
+        assert_equal 'ERSCSTEX022', err.code
+        assert_equal 500, err.http_status
+        assert_equal ['u2505-oneswap-test_netappshift', 'oneswap-shift-multidisk'],
+                     err.vm_names
+        # the readable message, not the "[object Object]" top-level one
+        assert_includes err.message, 'still powered on'
+        refute_includes err.message, '[object Object]'
     end
 
     def test_other_errors_surface_the_appliance_message
