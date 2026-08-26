@@ -1377,7 +1377,7 @@ _EOF_"
     #   - /path/to/qemu-ga-x86_64.msi         direct MSI file
     #   - /path/to/mounted-virtio-win/        directory already mounted
     #   - /path/to/virtio-win.iso             ISO file (mounted temporarily)
-     def resolve_qemu_ga_msi(path)
+    def resolve_qemu_ga_msi(path)
         if path.end_with?('.msi') && File.exist?(path)
             path
         elsif File.directory?(path)
