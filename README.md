@@ -289,7 +289,8 @@ Prerequisites, all created in the Shift UI beforehand:
 - The source NFS datastore mounted locally on the OneSwap host
   (`--shift-mount`); Shift writes `<vm-name>.qcow2` (plus
   `<vm-name>_1.qcow2`, ... for additional disks) next to each VM folder.
-- `virt-v2v-in-place` installed on the conversion host.
+- `virt-v2v-in-place` installed on the conversion host. **NOTE:** You may need
+  to add `/usr/libexec` to your path after installing this package.
 - vCenter credentials, same as any other conversion mode: the VM properties,
   NICs and tags the OpenNebula template is built from still come from vCenter,
   even though the disks do not.
@@ -326,14 +327,16 @@ is why the powered-off/no-snapshot preconditions the other modes enforce are
 skipped in Shift mode — and Shift's own clone leaves a snapshot behind anyway.
 
 ```
+# Unless you define these in the config file
 SOPTS='--shift https://<shift-ip> --shift-user admin --shift-pass ...'
 
 # Which blueprints exist, and how many VMs each covers
 oneswap list blueprints $SOPTS
 
-# Which VMs a blueprint would convert
+# Which VMs a blueprint named bp1 would convert
 oneswap list vms $SOPTS --shift-blueprint bp1
 
+# These values are also in the config file
 SOPTS="$SOPTS --shift-blueprint bp1 --shift-mount /mnt/shift"
 
 # Convert and import every VM in the blueprint
@@ -351,14 +354,14 @@ oneswap convert vm-web-01 $VOPTS $SOPTS --shift-skip-conversion
 # Trigger the blueprint but skip the compliance check (already checked, or resuming)
 oneswap convert $VOPTS $SOPTS --shift-skip-compliance
 
-# Import without the OS morph, for guests virt-v2v refuses to convert
+# Import without the OS morph, for guests virt-v2v refuses to convert or is not needed
 oneswap convert alpine-vm $VOPTS $SOPTS --shift-skip-morph
 ```
 
 After the disks are converted, OneSwap runs `virt-v2v-in-place` on them to
 install virtio drivers and fix the initramfs and bootloader for KVM. virt-v2v
 only recognises guests it has support for, and rejects the rest with
-`virt-v2v is unable to convert this guest type` — Alpine among them. Guests
+`virt-v2v is unable to convert this guest type`. Alpine is an example. Guests
 like that usually boot on KVM unmodified because virtio is already built in,
 so `--shift-skip-morph` imports the converted disks as they are. OneSwap names
 the flag in the error when it hits that case.
@@ -375,15 +378,14 @@ Notes:
   `list clusters` are vCenter concepts and always use vCenter.
 - One execution serves every later `oneswap convert` against that blueprint.
   OneSwap checks the blueprint state first and, if it has already converted,
-  reuses the disks on the mount instead of executing again -- Shift rejects a
+  reuses the disks on the mount instead of executing again. Shift rejects a
   second execution until the previous one is cleared. If an execution is
   still running, OneSwap attaches to it and waits instead of starting another.
   To genuinely convert again, clear the blueprint execution in the Shift UI
   (or with the `removeBpJobs.ps1` script NetApp ships) and re-run.
   `--shift-skip-conversion` is only needed to skip talking to Shift entirely.
 - The OS morph (`virt-v2v-in-place`) and context injection modify the qcow2
-  files on the datastore in place -- there is no local copy, so terabyte
-  disks work on workers with small local storage. To regenerate a disk,
+  files on the datastore in place, there is no local copy. To regenerate a disk,
   re-run the blueprint in the Shift UI; re-importing an already imported VM
   without regenerating it is unsupported (the guest would be morphed twice).
 - The wait for the blueprint execution runs until it finishes; interrupt
